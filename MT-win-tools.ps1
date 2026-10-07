@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param()
 
-# MT win tools v0.1.
+# MT win tools v0.1.1.
 # Windows PowerShell 5.1 and PowerShell 7 on Windows are supported.
 
 Set-StrictMode -Version 2.0
@@ -230,11 +230,18 @@ function Remove-MTWinDirectoryContents {
 
     if ([string]::IsNullOrWhiteSpace($Path) -or $Path.Length -lt 4) { return }
     if (-not (Test-Path -LiteralPath $Path)) { return }
+    $directory = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (-not $directory.PSIsContainer -or (Test-MTWinReparsePoint $directory)) { return }
 
     Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue | ForEach-Object {
         try {
             if (-not (Test-MTWinReparsePoint $_)) {
-                Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop
+                if ($_.PSIsContainer) {
+                    Remove-MTWinDirectoryContents -Path $_.FullName
+                    # Delete only an empty directory. Never recurse through junctions.
+                    [IO.Directory]::Delete($_.FullName, $false)
+                }
+                else { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop }
             }
         }
         catch {
@@ -265,6 +272,8 @@ function Remove-MTWinMatchingFiles {
     )
 
     if (-not (Test-Path -LiteralPath $Directory)) { return }
+    $directoryItem = Get-Item -LiteralPath $Directory -Force -ErrorAction Stop
+    if (-not $directoryItem.PSIsContainer -or (Test-MTWinReparsePoint $directoryItem)) { return }
 
     foreach ($pattern in $Patterns) {
         $parameters = @{
@@ -274,8 +283,6 @@ function Remove-MTWinMatchingFiles {
             Force = $true
             ErrorAction = 'SilentlyContinue'
         }
-        if ($Recurse) { $parameters['Recurse'] = $true }
-
         Get-ChildItem @parameters | ForEach-Object {
             try {
                 if (-not (Test-MTWinReparsePoint $_)) {
@@ -285,6 +292,12 @@ function Remove-MTWinMatchingFiles {
             catch {
             }
         }
+    }
+
+    if ($Recurse) {
+        Get-ChildItem -LiteralPath $Directory -Directory -Force -ErrorAction SilentlyContinue |
+            Where-Object { -not (Test-MTWinReparsePoint $_) } |
+            ForEach-Object { Remove-MTWinMatchingFiles -Directory $_.FullName -Patterns $Patterns -Recurse }
     }
 }
 
@@ -342,30 +355,29 @@ function Wait-MTWinServiceState {
         [int]$TimeoutSeconds = 30
     )
 
-    try {
-        $service = Get-Service -Name $Name -ErrorAction Stop
-        $desired = [System.ServiceProcess.ServiceControllerStatus]::$State
-        $service.WaitForStatus($desired, [TimeSpan]::FromSeconds($TimeoutSeconds))
-    }
-    catch {
-    }
+    $service = Get-Service -Name $Name -ErrorAction Stop
+    $desired = [System.ServiceProcess.ServiceControllerStatus]::$State
+    $service.WaitForStatus($desired, [TimeSpan]::FromSeconds($TimeoutSeconds))
 }
 
 function Stop-MTWinServicesTemporarily {
     param([string[]]$Names)
 
     $states = @{}
-    foreach ($name in $Names) {
-        try {
-            $service = Get-Service -Name $name -ErrorAction Stop
+    try {
+        foreach ($name in $Names) {
+            $service = Get-Service -Name $name -ErrorAction SilentlyContinue
+            if (-not $service) { continue }
             $states[$name] = [string]$service.Status
             if ($service.Status -ne 'Stopped') {
-                Stop-Service -Name $name -Force -ErrorAction SilentlyContinue
+                Stop-Service -Name $name -Force -ErrorAction Stop
                 Wait-MTWinServiceState -Name $name -State Stopped
             }
         }
-        catch {
-        }
+    }
+    catch {
+        Restore-MTWinServiceStates -States $states
+        throw
     }
     return $states
 }
@@ -373,16 +385,17 @@ function Stop-MTWinServicesTemporarily {
 function Restore-MTWinServiceStates {
     param([hashtable]$States)
 
+    $failed = @()
     foreach ($name in $States.Keys) {
         if ($States[$name] -eq 'Running') {
             try {
-                Start-Service -Name $name -ErrorAction SilentlyContinue
+                Start-Service -Name $name -ErrorAction Stop
                 Wait-MTWinServiceState -Name $name -State Running
             }
-            catch {
-            }
+            catch { $failed += $name }
         }
     }
+    if ($failed.Count -gt 0) { throw ('Could not restore service(s): ' + ($failed -join ', ')) }
 }
 
 function Remove-MTWinProtectedDirectory {
@@ -500,25 +513,25 @@ function Invoke-MTWinHibernationRefresh {
 
     Write-Host 'Recreating hiberfil.sys and restoring the enabled state.'
     try {
-        & $powercfg /hibernate off 2>&1 | Out-Host
+        Invoke-MTWinNativeCommand $powercfg @('/hibernate', 'off')
         for ($i = 0; $i -lt 30; $i++) {
             if (-not (Test-Path -LiteralPath $hiberFile)) { break }
             Start-Sleep -Milliseconds 250
         }
     }
     finally {
-        & $powercfg /hibernate on 2>&1 | Out-Host
+        Invoke-MTWinNativeCommand $powercfg @('/hibernate', 'on')
         if ($null -ne $sizePercent) {
             if ($sizePercent -lt 40) {
-                & $powercfg /hibernate /size 0 2>&1 | Out-Null
-                & $powercfg /hibernate /type reduced 2>&1 | Out-Null
+                Invoke-MTWinNativeCommand $powercfg @('/hibernate', '/size', '0')
+                Invoke-MTWinNativeCommand $powercfg @('/hibernate', '/type', 'reduced')
             }
-            elseif (($sizePercent -ge 50) -and ($sizePercent -le 100)) {
-                & $powercfg /hibernate /type full 2>&1 | Out-Null
-                & $powercfg /hibernate /size $sizePercent 2>&1 | Out-Null
+            elseif (($sizePercent -ge 40) -and ($sizePercent -le 100)) {
+                Invoke-MTWinNativeCommand $powercfg @('/hibernate', '/type', 'full')
+                Invoke-MTWinNativeCommand $powercfg @('/hibernate', '/size', [string]$sizePercent)
             }
             else {
-                & $powercfg /hibernate /type full 2>&1 | Out-Null
+                Invoke-MTWinNativeCommand $powercfg @('/hibernate', '/type', 'full')
             }
         }
     }
@@ -705,8 +718,7 @@ function Invoke-MTWinCleanupOperation {
             $docker = $dockerCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
             if ($docker) {
                 Write-Host 'Cleaning Docker build cache...'
-                & $docker builder prune --all --force 2>&1 | Out-Host
-                if ($LASTEXITCODE -ne 0) { Write-Warning "Docker returned exit code $LASTEXITCODE." }
+                Invoke-MTWinNativeCommand $docker @('builder', 'prune', '--all', '--force')
             }
         }
         'ComponentStore' {
@@ -716,8 +728,7 @@ function Invoke-MTWinCleanupOperation {
             }
             $dism = Join-Path $env:SystemRoot 'System32\dism.exe'
             if (-not (Test-Path -LiteralPath $dism)) { throw 'dism.exe is unavailable.' }
-            & $dism /Online /Cleanup-Image /StartComponentCleanup /ResetBase 2>&1 | Out-Host
-            if ($LASTEXITCODE -ne 0) { throw "DISM returned exit code $LASTEXITCODE." }
+            Invoke-MTWinNativeCommand $dism @('/Online', '/Cleanup-Image', '/StartComponentCleanup', '/ResetBase') @(0, 3010)
         }
         'RestorePoints' {
             $vssadmin = Join-Path $env:SystemRoot 'System32\vssadmin.exe'
@@ -728,7 +739,9 @@ function Invoke-MTWinCleanupOperation {
         'EventLogs' {
             $wevtutil = Join-Path $env:SystemRoot 'System32\wevtutil.exe'
             if (-not (Test-Path -LiteralPath $wevtutil)) { throw 'wevtutil.exe is unavailable.' }
-            & $wevtutil el 2>$null | ForEach-Object { & $wevtutil cl $_ 2>$null }
+            $logs = @(& $wevtutil el 2>&1)
+            if ($LASTEXITCODE -ne 0) { throw "Event-log enumeration failed with exit code $LASTEXITCODE." }
+            foreach ($log in $logs) { Invoke-MTWinNativeCommand $wevtutil @('cl', [string]$log) }
         }
         'DiskCleanup' {
             $cleanmgr = Join-Path $env:SystemRoot 'System32\cleanmgr.exe'
@@ -768,7 +781,10 @@ function Remove-MTWinRegistryValue {
 
     $resolvedPath = Resolve-MTWinRegistryPath -Path $Path
     if (Test-Path -LiteralPath $resolvedPath) {
-        Remove-ItemProperty -LiteralPath $resolvedPath -Name $Name -Force -ErrorAction SilentlyContinue
+        $key = Get-Item -LiteralPath $resolvedPath -ErrorAction Stop
+        if ($key.GetValueNames() -contains $Name) {
+            Remove-ItemProperty -LiteralPath $resolvedPath -Name $Name -Force -ErrorAction Stop
+        }
     }
 }
 
@@ -852,15 +868,17 @@ function Remove-MTWinAppxPackage {
 
     $getCommand = Get-Command Get-AppxPackage -ErrorAction SilentlyContinue
     $removeCommand = Get-Command Remove-AppxPackage -ErrorAction SilentlyContinue
-    if (-not $getCommand -or -not $removeCommand) { Write-Host 'App package management is unavailable.'; return }
-    Get-AppxPackage -AllUsers -Name $Name -ErrorAction SilentlyContinue | ForEach-Object {
+    if (-not $getCommand -or -not $removeCommand) { Write-Host 'App package management is unavailable.'; return $false }
+    $packages = @(Get-AppxPackage -AllUsers -Name $Name -ErrorAction Stop)
+    foreach ($package in $packages) {
         if ($removeCommand.Parameters.ContainsKey('AllUsers')) {
-            Remove-AppxPackage -Package $_.PackageFullName -AllUsers -ErrorAction SilentlyContinue
+            Remove-AppxPackage -Package $package.PackageFullName -AllUsers -ErrorAction Stop
         }
         else {
-            Remove-AppxPackage -Package $_.PackageFullName -ErrorAction SilentlyContinue
+            Remove-AppxPackage -Package $package.PackageFullName -ErrorAction Stop
         }
     }
+    return ($packages.Count -gt 0)
 }
 
 function Invoke-MTWinTweak {
@@ -883,9 +901,11 @@ function Invoke-MTWinTweak {
         'RemoveWidgets' {
             if ((Get-MTWinWindowsBuild) -lt 22000) { Write-Warning 'Widgets are only available on Windows 11.'; return $null }
             Get-Process -Name '*Widget*' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            $removed = $false
             foreach ($name in @('Microsoft.WidgetsPlatformRuntime', 'MicrosoftWindows.Client.WebExperience')) {
-                Remove-MTWinAppxPackage $name
+                if (Remove-MTWinAppxPackage $name) { $removed = $true }
             }
+            if (-not $removed) { return $null }
             return 'Explorer restart'
         }
         'PreviousStartMenu' {
@@ -998,13 +1018,8 @@ function Invoke-MTWinTweak {
             $setup = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
             if (-not $setup) { Write-Warning 'OneDrive setup was not found.'; return $null }
             Invoke-MTWinNativeCommand $setup @('/uninstall') @(0, 3010)
-            foreach ($path in @(
-                (Join-Path $profile 'OneDrive'),
-                (Join-Path $profile 'AppData\Local\Microsoft\OneDrive'),
-                (Join-Path $env:ProgramData 'Microsoft OneDrive'),
-                (Join-Path $env:SystemDrive 'OneDriveTemp')
-            )) { Remove-MTWinProtectedDirectory $path }
-            Get-Service -Name 'OneSyncSvc*' -ErrorAction SilentlyContinue | ForEach-Object { Set-Service -Name $_.Name -StartupType Disabled -ErrorAction SilentlyContinue }
+            # Let OneDrive's uninstaller remove its own binaries. Keep synced and
+            # unsynced user files and unrelated Windows OneSync services intact.
             return 'Sign-out'
         }
         'DisableExplorerHomeGallery' {
@@ -1050,7 +1065,7 @@ function Invoke-MTWinTweak {
             Set-MTWinRegistryValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' 'SettingsPageVisibility' 'hide:aicomponents' String
             Set-MTWinRegistryValue 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsNotepad' 'DisableAIFeatures' 1
             foreach ($name in @('Microsoft.Copilot', 'Microsoft.MicrosoftOfficeHub', 'MicrosoftWindows.Client.AIX')) {
-                Remove-MTWinAppxPackage $name
+                [void](Remove-MTWinAppxPackage $name)
             }
             [void](Set-MTWinServiceStartup 'WSAIFabricSvc' Disabled)
             if (Get-WindowsOptionalFeature -Online -FeatureName Recall -ErrorAction SilentlyContinue) {
@@ -1197,8 +1212,7 @@ function Get-MTWinPreferenceDescriptor {
             @{ Path='HKCU:\Software\Policies\Microsoft\Power\PowerSettings\f15576e8-98b7-4186-b944-eafa664402d9'; Name='ACSettingIndex'; Type='DWord'; On=1; Off=0; RemoveOff=$false }) } }
         'S3Sleep' { return @{ Effect='System restart'; Settings=@(
             @{ Path='HKLM:\SYSTEM\CurrentControlSet\Control\Power'; Name='PlatformAoAcOverride'; Type='DWord'; On=0; Off=0; RemoveOff=$true }) } }
-        'SettingsHome' { return @{ Effect='Settings restart'; Settings=@(
-            @{ Path='HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer'; Name='SettingsPageVisibility'; Type='String'; On='show:home'; Off='hide:home'; RemoveOff=$false }) } }
+        'SettingsHome' { return @{ Effect='Settings restart'; Settings=@() } }
         'BingSearch' { return @{ Effect='Explorer restart'; Settings=@(
             @{ Path='HKCU:\Software\Microsoft\Windows\CurrentVersion\Search'; Name='BingSearchEnabled'; Type='DWord'; On=1; Off=0; RemoveOff=$false }) } }
         'LoginAcrylic' { return @{ Effect='System restart'; Settings=@(
@@ -1236,8 +1250,51 @@ function Get-MTWinPreferenceDescriptor {
     }
 }
 
+function Get-MTWinSettingsPageVisibility {
+    $path = Resolve-MTWinRegistryPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer'
+    if (-not (Test-Path -LiteralPath $path)) { return '' }
+    $key = Get-Item -LiteralPath $path -ErrorAction Stop
+    return [string]$key.GetValue('SettingsPageVisibility', '')
+}
+
+function Set-MTWinSettingsHomeVisibility {
+    param([bool]$Enabled)
+
+    $path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer'
+    $visibility = Get-MTWinSettingsPageVisibility
+    $mode = 'hide'
+    $pages = @()
+    if ($visibility -match '^(hide|showonly):(.*)$') {
+        $mode = $matches[1].ToLowerInvariant()
+        $pages = @($matches[2].Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -ne 'home' })
+    }
+    elseif ($visibility -and $visibility -ne 'show:home') {
+        throw 'Settings page visibility has an unrecognized format; it was left unchanged.'
+    }
+
+    if (($mode -eq 'hide' -and -not $Enabled) -or ($mode -eq 'showonly' -and $Enabled)) { $pages += 'home' }
+    if ($pages.Count -eq 0 -and $mode -eq 'hide') {
+        Remove-MTWinRegistryValue $path 'SettingsPageVisibility'
+    }
+    else {
+        Set-MTWinRegistryValue $path 'SettingsPageVisibility' ($mode + ':' + ($pages -join ';')) String
+    }
+}
+
 function Get-MTWinPreferenceState {
     param([Parameter(Mandatory = $true)][string]$Id)
+
+    if ($Id -eq 'SettingsHome') {
+        try { $visibility = Get-MTWinSettingsPageVisibility }
+        catch { Write-Warning 'Settings page visibility could not be read.'; return $false }
+        if ($visibility -match '^(hide|showonly):(.*)$') {
+            $mode = $matches[1]
+            $pages = @($matches[2].Split(';') | ForEach-Object { $_.Trim() })
+            if ($mode -eq 'hide') { return ($pages -notcontains 'home') }
+            return ($pages -contains 'home')
+        }
+        return $true
+    }
 
     $descriptor = Get-MTWinPreferenceDescriptor $Id
     foreach ($setting in $descriptor.Settings) {
@@ -1254,6 +1311,11 @@ function Invoke-MTWinPreference {
         [Parameter(Mandatory = $true)][string]$Id,
         [Parameter(Mandatory = $true)][bool]$Enabled
     )
+
+    if ($Id -eq 'SettingsHome') {
+        Set-MTWinSettingsHomeVisibility -Enabled $Enabled
+        return 'Settings restart'
+    }
 
     $descriptor = Get-MTWinPreferenceDescriptor $Id
     foreach ($setting in $descriptor.Settings) {
@@ -1381,6 +1443,9 @@ function Invoke-MTWinToolsOperationBatch {
     )
 
     $failures = 0
+    $completedIds = @()
+    $skippedIds = @()
+    $failedIds = @()
     $effects = @()
     $freeBefore = 0
 
@@ -1408,14 +1473,17 @@ function Invoke-MTWinToolsOperationBatch {
             try {
                 $completed = Invoke-MTWinCleanupOperation -Id $id -Context $context
                 if ($completed -eq $false) {
+                    $skippedIds += $id
                     Write-MTWinStatus -Message $displayName -Level Warning
                 }
                 else {
+                    $completedIds += $id
                     Write-MTWinStatus -Message $displayName -Level Success
                 }
             }
             catch {
                 $failures++
+                $failedIds += $id
                 Write-MTWinStatus -Message ("$displayName - " + $_.Exception.Message) -Level Error
             }
         }
@@ -1447,15 +1515,18 @@ function Invoke-MTWinToolsOperationBatch {
                     $effect = Invoke-MTWinTweak -Id $id
                 }
                 if ($null -eq $effect) {
+                    $skippedIds += $id
                     Write-MTWinStatus -Message $displayName -Level Warning
                 }
                 else {
+                    $completedIds += $id
                     if ([string]$effect -ne 'No restart' -and -not [string]::IsNullOrWhiteSpace([string]$effect)) { $effects += $effect }
                     Write-MTWinStatus -Message $displayName -Level Success
                 }
             }
             catch {
                 $failures++
+                $failedIds += $id
                 Write-MTWinStatus -Message ("$displayName - " + $_.Exception.Message) -Level Error
             }
         }
@@ -1474,6 +1545,9 @@ function Invoke-MTWinToolsOperationBatch {
     [pscustomobject]@{
         Kind = $Kind
         Failures = $failures
+        CompletedIds = $completedIds
+        SkippedIds = $skippedIds
+        FailedIds = $failedIds
         Effects = $effects
     }
 }
@@ -1497,6 +1571,7 @@ function Start-MTWinOperationJob {
         'Get-MTWinWindowsBuild', 'Get-MTWinCallerProfilePath', 'Set-MTWinServiceStartup',
         'Restart-MTWinExplorer', 'Invoke-MTWinNativeCommand', 'Remove-MTWinAppxPackage', 'Invoke-MTWinTweak',
         'Get-MTWinPreferenceDescriptor', 'Invoke-MTWinPreference', 'Invoke-MTWinChoice',
+        'Get-MTWinSettingsPageVisibility', 'Set-MTWinSettingsHomeVisibility',
         'Get-MTWinOperationDisplayName', 'Invoke-MTWinToolsOperationBatch'
     )
 
@@ -1712,9 +1787,9 @@ namespace MTWinTools {
                 <Setter.Value>
                     <ControlTemplate TargetType="Button">
                         <Border x:Name="Chrome" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
-                                BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="10" ClipToBounds="True">
+                                BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="12" ClipToBounds="True">
                             <Grid>
-                                <Border x:Name="HoverOverlay" Background="{DynamicResource ControlBrush}" CornerRadius="8" Opacity="0" IsHitTestVisible="False"/>
+                                <Border x:Name="HoverOverlay" Background="{DynamicResource ControlBrush}" CornerRadius="10" Opacity="0" IsHitTestVisible="False"/>
                                 <ContentPresenter Margin="{TemplateBinding Padding}" HorizontalAlignment="Center" VerticalAlignment="Center"/>
                             </Grid>
                         </Border>
@@ -1723,10 +1798,10 @@ namespace MTWinTools {
                             <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Chrome" Property="BorderBrush" Value="{DynamicResource FocusBrush}"/></Trigger>
                             <Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.38"/></Trigger>
                             <EventTrigger RoutedEvent="MouseEnter">
-                                <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="HoverOverlay" Storyboard.TargetProperty="Opacity" To="1" Duration="0:0:0.14"/></Storyboard></BeginStoryboard>
+                                <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="HoverOverlay" Storyboard.TargetProperty="Opacity" To="1" Duration="0:0:0.14"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction></DoubleAnimation></Storyboard></BeginStoryboard>
                             </EventTrigger>
                             <EventTrigger RoutedEvent="MouseLeave">
-                                <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="HoverOverlay" Storyboard.TargetProperty="Opacity" To="0" Duration="0:0:0.14"/></Storyboard></BeginStoryboard>
+                                <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="HoverOverlay" Storyboard.TargetProperty="Opacity" To="0" Duration="0:0:0.14"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction></DoubleAnimation></Storyboard></BeginStoryboard>
                             </EventTrigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
@@ -1748,7 +1823,7 @@ namespace MTWinTools {
                 <Setter.Value>
                     <ControlTemplate TargetType="Button">
                         <Border x:Name="Chrome" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
-                                BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="7" ClipToBounds="True">
+                                BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="6" ClipToBounds="True">
                             <Grid>
                                 <Border x:Name="HoverOverlay" Background="{DynamicResource RaisedBrush}" CornerRadius="5" Opacity="0" IsHitTestVisible="False"/>
                                 <ContentPresenter Margin="{TemplateBinding Padding}" HorizontalAlignment="Center" VerticalAlignment="Center"/>
@@ -1759,10 +1834,10 @@ namespace MTWinTools {
                             <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Chrome" Property="BorderBrush" Value="{DynamicResource FocusBrush}"/></Trigger>
                             <Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.36"/><Setter Property="Cursor" Value="Arrow"/></Trigger>
                             <EventTrigger RoutedEvent="MouseEnter">
-                                <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="HoverOverlay" Storyboard.TargetProperty="Opacity" To="1" Duration="0:0:0.14"/></Storyboard></BeginStoryboard>
+                                <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="HoverOverlay" Storyboard.TargetProperty="Opacity" To="1" Duration="0:0:0.14"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction></DoubleAnimation></Storyboard></BeginStoryboard>
                             </EventTrigger>
                             <EventTrigger RoutedEvent="MouseLeave">
-                                <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="HoverOverlay" Storyboard.TargetProperty="Opacity" To="0" Duration="0:0:0.14"/></Storyboard></BeginStoryboard>
+                                <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="HoverOverlay" Storyboard.TargetProperty="Opacity" To="0" Duration="0:0:0.14"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction></DoubleAnimation></Storyboard></BeginStoryboard>
                             </EventTrigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
@@ -1786,8 +1861,8 @@ namespace MTWinTools {
                     <ControlTemplate TargetType="Button">
                         <Grid>
                             <Border x:Name="Chrome" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
-                                    BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="10" Padding="{TemplateBinding Padding}"/>
-                            <Border x:Name="HoverOverlay" Background="{DynamicResource SurfaceBrush}" CornerRadius="10" Opacity="0" IsHitTestVisible="False"/>
+                                    BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="12" Padding="{TemplateBinding Padding}"/>
+                            <Border x:Name="HoverOverlay" Background="{DynamicResource SurfaceBrush}" CornerRadius="12" Opacity="0" IsHitTestVisible="False"/>
                             <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
                         </Grid>
                         <ControlTemplate.Triggers>
@@ -1795,10 +1870,10 @@ namespace MTWinTools {
                             <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Chrome" Property="BorderBrush" Value="{DynamicResource FocusBrush}"/></Trigger>
                             <Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.36"/><Setter Property="Cursor" Value="Arrow"/></Trigger>
                             <EventTrigger RoutedEvent="MouseEnter">
-                                <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="HoverOverlay" Storyboard.TargetProperty="Opacity" To="0.12" Duration="0:0:0.14"/></Storyboard></BeginStoryboard>
+                                <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="HoverOverlay" Storyboard.TargetProperty="Opacity" To="0.12" Duration="0:0:0.14"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction></DoubleAnimation></Storyboard></BeginStoryboard>
                             </EventTrigger>
                             <EventTrigger RoutedEvent="MouseLeave">
-                                <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="HoverOverlay" Storyboard.TargetProperty="Opacity" To="0" Duration="0:0:0.14"/></Storyboard></BeginStoryboard>
+                                <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="HoverOverlay" Storyboard.TargetProperty="Opacity" To="0" Duration="0:0:0.14"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction></DoubleAnimation></Storyboard></BeginStoryboard>
                             </EventTrigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
@@ -1822,7 +1897,7 @@ namespace MTWinTools {
                 <Setter.Value>
                     <ControlTemplate TargetType="ToggleButton">
                         <Border x:Name="Chrome" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
-                                BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="10">
+                                BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="8">
                             <ContentPresenter x:Name="Content" Margin="{TemplateBinding Padding}" Opacity="0.74"
                                               HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="Center"/>
                         </Border>
@@ -1840,7 +1915,7 @@ namespace MTWinTools {
                                 </MultiTrigger.Conditions>
                                 <Setter TargetName="Content" Property="Opacity" Value="1"/>
                                 <MultiTrigger.EnterActions>
-                                    <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="Content" Storyboard.TargetProperty="Opacity" From="0.74" To="1" Duration="0:0:0.14" FillBehavior="Stop"/></Storyboard></BeginStoryboard>
+                                    <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="Content" Storyboard.TargetProperty="Opacity" From="0.74" To="1" Duration="0:0:0.14" FillBehavior="Stop"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction></DoubleAnimation></Storyboard></BeginStoryboard>
                                 </MultiTrigger.EnterActions>
                             </MultiTrigger>
                             <MultiTrigger>
@@ -1850,7 +1925,7 @@ namespace MTWinTools {
                                 </MultiTrigger.Conditions>
                                 <Setter TargetName="Content" Property="Opacity" Value="0.74"/>
                                 <MultiTrigger.EnterActions>
-                                    <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="Content" Storyboard.TargetProperty="Opacity" From="1" To="0.74" Duration="0:0:0.14" FillBehavior="Stop"/></Storyboard></BeginStoryboard>
+                                    <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="Content" Storyboard.TargetProperty="Opacity" From="1" To="0.74" Duration="0:0:0.14" FillBehavior="Stop"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction></DoubleAnimation></Storyboard></BeginStoryboard>
                                 </MultiTrigger.EnterActions>
                             </MultiTrigger>
                         </ControlTemplate.Triggers>
@@ -1875,7 +1950,7 @@ namespace MTWinTools {
                 <Setter.Value>
                     <ControlTemplate TargetType="ToggleButton">
                         <Border x:Name="Chrome" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
-                                BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="7">
+                                BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="6">
                             <ContentPresenter x:Name="Content" Margin="{TemplateBinding Padding}" Opacity="0.54"
                                               HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="Center"/>
                         </Border>
@@ -1893,7 +1968,7 @@ namespace MTWinTools {
                                 </MultiTrigger.Conditions>
                                 <Setter TargetName="Content" Property="Opacity" Value="1"/>
                                 <MultiTrigger.EnterActions>
-                                    <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="Content" Storyboard.TargetProperty="Opacity" From="0.54" To="1" Duration="0:0:0.14" FillBehavior="Stop"/></Storyboard></BeginStoryboard>
+                                    <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="Content" Storyboard.TargetProperty="Opacity" From="0.54" To="1" Duration="0:0:0.14" FillBehavior="Stop"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction></DoubleAnimation></Storyboard></BeginStoryboard>
                                 </MultiTrigger.EnterActions>
                             </MultiTrigger>
                             <MultiTrigger>
@@ -1903,7 +1978,7 @@ namespace MTWinTools {
                                 </MultiTrigger.Conditions>
                                 <Setter TargetName="Content" Property="Opacity" Value="0.54"/>
                                 <MultiTrigger.EnterActions>
-                                    <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="Content" Storyboard.TargetProperty="Opacity" From="1" To="0.54" Duration="0:0:0.14" FillBehavior="Stop"/></Storyboard></BeginStoryboard>
+                                    <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="Content" Storyboard.TargetProperty="Opacity" From="1" To="0.54" Duration="0:0:0.14" FillBehavior="Stop"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction></DoubleAnimation></Storyboard></BeginStoryboard>
                                 </MultiTrigger.EnterActions>
                             </MultiTrigger>
                         </ControlTemplate.Triggers>
@@ -1926,21 +2001,17 @@ namespace MTWinTools {
                     <ControlTemplate TargetType="CheckBox">
                         <Grid>
                             <Border x:Name="Card" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
-                                    BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="10"/>
-                            <Border x:Name="HoverOverlay" Background="{DynamicResource TextBrush}" CornerRadius="10" Opacity="0" IsHitTestVisible="False"/>
+                                    BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="12"/>
+                            <Border x:Name="SelectedOverlay" Background="{DynamicResource SelectedBrush}" CornerRadius="12" Opacity="0" IsHitTestVisible="False"/>
+                            <Border x:Name="HoverOverlay" Background="{DynamicResource TextBrush}" CornerRadius="12" Opacity="0" IsHitTestVisible="False"/>
+                            <Border x:Name="FocusFrame" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="12" IsHitTestVisible="False"/>
                             <ContentPresenter Margin="{TemplateBinding Padding}" VerticalAlignment="Center"/>
                         </Grid>
                         <ControlTemplate.Triggers>
-                            <Trigger Property="IsChecked" Value="True"><Setter TargetName="Card" Property="Background" Value="{DynamicResource SelectedBrush}"/></Trigger>
+                            <Trigger Property="IsChecked" Value="True"><Setter TargetName="SelectedOverlay" Property="Opacity" Value="1"/><Trigger.EnterActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="SelectedOverlay" Storyboard.TargetProperty="Opacity" From="0" To="1" Duration="0:0:0.14" FillBehavior="Stop"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction></DoubleAnimation></Storyboard></BeginStoryboard></Trigger.EnterActions><Trigger.ExitActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="SelectedOverlay" Storyboard.TargetProperty="Opacity" From="1" To="0" Duration="0:0:0.14" FillBehavior="Stop"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction></DoubleAnimation></Storyboard></BeginStoryboard></Trigger.ExitActions></Trigger>
                             <Trigger Property="IsPressed" Value="True"><Setter TargetName="HoverOverlay" Property="Opacity" Value="0.09"/></Trigger>
-                            <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Card" Property="BorderBrush" Value="{DynamicResource FocusBrush}"/></Trigger>
+                            <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="FocusFrame" Property="BorderBrush" Value="{DynamicResource FocusBrush}"/></Trigger>
                             <Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.38"/></Trigger>
-                            <EventTrigger RoutedEvent="MouseEnter">
-                                <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="HoverOverlay" Storyboard.TargetProperty="Opacity" To="0.16" Duration="0:0:0.14"/></Storyboard></BeginStoryboard>
-                            </EventTrigger>
-                            <EventTrigger RoutedEvent="MouseLeave">
-                                <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="HoverOverlay" Storyboard.TargetProperty="Opacity" To="0" Duration="0:0:0.14"/></Storyboard></BeginStoryboard>
-                            </EventTrigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
                 </Setter.Value>
@@ -1961,8 +2032,9 @@ namespace MTWinTools {
                     <ControlTemplate TargetType="CheckBox">
                         <Grid>
                             <Border x:Name="Card" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
-                                    BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="10"/>
-                            <Border x:Name="HoverOverlay" Background="{DynamicResource TextBrush}" CornerRadius="10" Opacity="0" IsHitTestVisible="False"/>
+                                    BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="12"/>
+                            <Border x:Name="SelectedOverlay" Background="{DynamicResource SelectedBrush}" CornerRadius="12" Opacity="0" IsHitTestVisible="False"/>
+                            <Border x:Name="FocusFrame" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="12" IsHitTestVisible="False"/>
                             <Grid Margin="{TemplateBinding Padding}">
                                 <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="40"/></Grid.ColumnDefinitions>
                                 <ContentPresenter Grid.Column="0" VerticalAlignment="Center" Margin="0,0,14,0"/>
@@ -1976,20 +2048,14 @@ namespace MTWinTools {
                         </Grid>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsChecked" Value="True">
-                                <Setter TargetName="Card" Property="Background" Value="{DynamicResource SelectedBrush}"/>
+                                <Setter TargetName="SelectedOverlay" Property="Opacity" Value="1"/>
                                 <Setter TargetName="Track" Property="Background" Value="{DynamicResource TextBrush}"/>
                                 <Setter TargetName="Thumb" Property="Fill" Value="{DynamicResource SurfaceBrush}"/>
-                                <Trigger.EnterActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="ThumbTranslate" Storyboard.TargetProperty="X" To="16" Duration="0:0:0.14"/></Storyboard></BeginStoryboard></Trigger.EnterActions>
-                                <Trigger.ExitActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="ThumbTranslate" Storyboard.TargetProperty="X" To="0" Duration="0:0:0.14"/></Storyboard></BeginStoryboard></Trigger.ExitActions>
+                                <Trigger.EnterActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="SelectedOverlay" Storyboard.TargetProperty="Opacity" From="0" To="1" Duration="0:0:0.14" FillBehavior="Stop"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction></DoubleAnimation><DoubleAnimation Storyboard.TargetName="ThumbTranslate" Storyboard.TargetProperty="X" To="16" Duration="0:0:0.14"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction></DoubleAnimation></Storyboard></BeginStoryboard></Trigger.EnterActions>
+                                <Trigger.ExitActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="SelectedOverlay" Storyboard.TargetProperty="Opacity" From="1" To="0" Duration="0:0:0.14" FillBehavior="Stop"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction></DoubleAnimation><DoubleAnimation Storyboard.TargetName="ThumbTranslate" Storyboard.TargetProperty="X" To="0" Duration="0:0:0.14"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction></DoubleAnimation></Storyboard></BeginStoryboard></Trigger.ExitActions>
                             </Trigger>
-                            <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Card" Property="BorderBrush" Value="{DynamicResource FocusBrush}"/></Trigger>
+                            <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="FocusFrame" Property="BorderBrush" Value="{DynamicResource FocusBrush}"/></Trigger>
                             <Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.38"/></Trigger>
-                            <EventTrigger RoutedEvent="MouseEnter">
-                                <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="HoverOverlay" Storyboard.TargetProperty="Opacity" To="0.16" Duration="0:0:0.14"/></Storyboard></BeginStoryboard>
-                            </EventTrigger>
-                            <EventTrigger RoutedEvent="MouseLeave">
-                                <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="HoverOverlay" Storyboard.TargetProperty="Opacity" To="0" Duration="0:0:0.14"/></Storyboard></BeginStoryboard>
-                            </EventTrigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
                 </Setter.Value>
@@ -2005,8 +2071,8 @@ namespace MTWinTools {
                 <Setter.Value>
                     <ControlTemplate TargetType="ToggleButton">
                         <Grid>
-                            <Border x:Name="Chrome" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="10"/>
-                            <Border x:Name="HoverOverlay" Background="{DynamicResource TextBrush}" CornerRadius="10" Opacity="0" IsHitTestVisible="False"/>
+                            <Border x:Name="Chrome" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="12"/>
+                            <Border x:Name="HoverOverlay" Background="{DynamicResource TextBrush}" CornerRadius="12" Opacity="0" IsHitTestVisible="False"/>
                             <Grid Margin="12,0,12,0">
                                 <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="18"/></Grid.ColumnDefinitions>
                                 <ContentPresenter Grid.Column="0" VerticalAlignment="Center" HorizontalAlignment="Left"
@@ -2019,10 +2085,10 @@ namespace MTWinTools {
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Chrome" Property="BorderBrush" Value="{DynamicResource FocusBrush}"/></Trigger>
                             <EventTrigger RoutedEvent="MouseEnter">
-                                <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="HoverOverlay" Storyboard.TargetProperty="Opacity" To="0.16" Duration="0:0:0.14"/></Storyboard></BeginStoryboard>
+                                <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="HoverOverlay" Storyboard.TargetProperty="Opacity" To="0.16" Duration="0:0:0.14"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction></DoubleAnimation></Storyboard></BeginStoryboard>
                             </EventTrigger>
                             <EventTrigger RoutedEvent="MouseLeave">
-                                <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="HoverOverlay" Storyboard.TargetProperty="Opacity" To="0" Duration="0:0:0.14"/></Storyboard></BeginStoryboard>
+                                <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="HoverOverlay" Storyboard.TargetProperty="Opacity" To="0" Duration="0:0:0.14"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction></DoubleAnimation></Storyboard></BeginStoryboard>
                             </EventTrigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
@@ -2038,19 +2104,19 @@ namespace MTWinTools {
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="ComboBoxItem">
-                        <Border x:Name="Item" Background="{TemplateBinding Background}" CornerRadius="7" ClipToBounds="True">
+                        <Border x:Name="Item" Background="{TemplateBinding Background}" CornerRadius="6" ClipToBounds="True">
                             <Grid>
-                                <Border x:Name="HoverOverlay" Background="{DynamicResource ControlBrush}" CornerRadius="7" Opacity="0" IsHitTestVisible="False"/>
+                                <Border x:Name="HoverOverlay" Background="{DynamicResource ControlBrush}" CornerRadius="6" Opacity="0" IsHitTestVisible="False"/>
                                 <ContentPresenter Margin="{TemplateBinding Padding}"/>
                             </Grid>
                         </Border>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsSelected" Value="True"><Setter TargetName="Item" Property="Background" Value="{DynamicResource SelectedBrush}"/></Trigger>
                             <EventTrigger RoutedEvent="MouseEnter">
-                                <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="HoverOverlay" Storyboard.TargetProperty="Opacity" To="1" Duration="0:0:0.14"/></Storyboard></BeginStoryboard>
+                                <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="HoverOverlay" Storyboard.TargetProperty="Opacity" To="1" Duration="0:0:0.14"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction></DoubleAnimation></Storyboard></BeginStoryboard>
                             </EventTrigger>
                             <EventTrigger RoutedEvent="MouseLeave">
-                                <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="HoverOverlay" Storyboard.TargetProperty="Opacity" To="0" Duration="0:0:0.14"/></Storyboard></BeginStoryboard>
+                                <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="HoverOverlay" Storyboard.TargetProperty="Opacity" To="0" Duration="0:0:0.14"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction></DoubleAnimation></Storyboard></BeginStoryboard>
                             </EventTrigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
@@ -2076,7 +2142,7 @@ namespace MTWinTools {
                             <Popup x:Name="Popup" Placement="Bottom" AllowsTransparency="True" PopupAnimation="Fade" Focusable="False"
                                    IsOpen="{TemplateBinding IsDropDownOpen}">
                                 <Border Margin="0,6,0,0" Padding="6" MinWidth="{Binding ActualWidth, ElementName=ToggleButton}" MaxHeight="{TemplateBinding MaxDropDownHeight}"
-                                        Background="{DynamicResource PanelBrush}" CornerRadius="10" BorderBrush="{DynamicResource RaisedBrush}" BorderThickness="1">
+                                        Background="{DynamicResource PanelBrush}" CornerRadius="12" BorderBrush="{DynamicResource RaisedBrush}" BorderThickness="1">
                                     <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
                                         <StackPanel IsItemsHost="True" KeyboardNavigation.DirectionalNavigation="Contained"/>
                                     </ScrollViewer>
@@ -2104,18 +2170,18 @@ namespace MTWinTools {
                 <Setter.Value>
                     <ControlTemplate TargetType="Button">
                         <Grid>
-                            <Border x:Name="Card" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="10"/>
-                            <Border x:Name="HoverOverlay" Background="{DynamicResource TextBrush}" CornerRadius="10" Opacity="0" IsHitTestVisible="False"/>
+                            <Border x:Name="Card" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="12"/>
+                            <Border x:Name="HoverOverlay" Background="{DynamicResource TextBrush}" CornerRadius="12" Opacity="0" IsHitTestVisible="False"/>
                             <ContentPresenter Margin="{TemplateBinding Padding}" VerticalAlignment="Center"/>
                         </Grid>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsPressed" Value="True"><Setter TargetName="HoverOverlay" Property="Opacity" Value="0.09"/></Trigger>
                             <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Card" Property="BorderBrush" Value="{DynamicResource FocusBrush}"/></Trigger>
                             <EventTrigger RoutedEvent="MouseEnter">
-                                <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="HoverOverlay" Storyboard.TargetProperty="Opacity" To="0.16" Duration="0:0:0.14"/></Storyboard></BeginStoryboard>
+                                <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="HoverOverlay" Storyboard.TargetProperty="Opacity" To="0.16" Duration="0:0:0.14"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction></DoubleAnimation></Storyboard></BeginStoryboard>
                             </EventTrigger>
                             <EventTrigger RoutedEvent="MouseLeave">
-                                <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="HoverOverlay" Storyboard.TargetProperty="Opacity" To="0" Duration="0:0:0.14"/></Storyboard></BeginStoryboard>
+                                <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="HoverOverlay" Storyboard.TargetProperty="Opacity" To="0" Duration="0:0:0.14"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction></DoubleAnimation></Storyboard></BeginStoryboard>
                             </EventTrigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
@@ -2264,26 +2330,25 @@ namespace MTWinTools {
     <Grid x:Name="RootGrid">
         <Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
 
-        <Grid x:Name="AppGrid" Grid.Row="0" Margin="24,20,24,14" MaxWidth="1120" HorizontalAlignment="Center" VerticalAlignment="Center">
+        <Grid x:Name="AppGrid" Grid.Row="0" Margin="24,28,24,16" MaxWidth="1120" HorizontalAlignment="Center" VerticalAlignment="Center">
             <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
 
         <Grid x:Name="HeaderGrid" Grid.Row="0" Margin="4,0,4,20">
             <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
             <StackPanel Grid.Column="0" VerticalAlignment="Bottom">
-                <TextBlock Text="Mick's Tools" Foreground="{DynamicResource MutedBrush}" FontSize="14" FontWeight="SemiBold" Margin="0,0,0,4"/>
-                <TextBlock x:Name="TitleText" Text="MT win tools" Foreground="{DynamicResource TextBrush}" FontSize="32" FontWeight="SemiBold"/>
+                <TextBlock x:Name="TitleText" Text="MT win tools" Foreground="{DynamicResource TextBrush}" FontSize="36" FontWeight="SemiBold"/>
             </StackPanel>
             <Button x:Name="AppearanceButton" Grid.Column="1" Style="{StaticResource AppearanceButtonStyle}" VerticalAlignment="Bottom" AutomationProperties.Name="Appearance"/>
         </Grid>
 
         <Border x:Name="MainShell" Grid.Row="1" MaxHeight="720" MinHeight="320" HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
-                Background="{DynamicResource SurfaceBrush}" CornerRadius="24" Padding="12">
+                Background="Transparent" CornerRadius="24" Padding="0">
             <Border.Effect><DropShadowEffect BlurRadius="48" ShadowDepth="18" Opacity="0.28" Color="#000000"/></Border.Effect>
             <Grid x:Name="ShellGrid">
-                <Grid.ColumnDefinitions><ColumnDefinition Width="214"/><ColumnDefinition Width="12"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                <Grid.ColumnDefinitions><ColumnDefinition Width="214"/><ColumnDefinition Width="2"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
                 <Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="0"/><RowDefinition Height="0"/></Grid.RowDefinitions>
 
-                <Border x:Name="RailPanel" Grid.Column="0" Grid.Row="0" Background="{DynamicResource PanelBrush}" CornerRadius="12" Padding="10">
+                <Border x:Name="RailPanel" Grid.Column="0" Grid.Row="0" Background="{DynamicResource PanelBrush}" Padding="16">
                     <ScrollViewer x:Name="RailScroll" Style="{StaticResource OverlayScrollViewerStyle}" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" CanContentScroll="False">
                         <StackPanel x:Name="MainNavPanel">
                             <ToggleButton x:Name="NavCleanup" Content="Cleanup" Style="{StaticResource NavButtonStyle}" IsChecked="True"/>
@@ -2314,11 +2379,11 @@ namespace MTWinTools {
                 </Border>
 
                 <Grid x:Name="WorkspaceHost" Grid.Column="2" Grid.Row="0">
-                    <Border x:Name="CleanupPanel" Background="{DynamicResource PanelBrush}" CornerRadius="12">
+                    <Border x:Name="CleanupPanel" Background="{DynamicResource PanelBrush}">
                         <Grid>
                             <Grid.RowDefinitions><RowDefinition Height="52"/><RowDefinition Height="*"/><RowDefinition Height="68"/></Grid.RowDefinitions>
-                            <Border Grid.Row="0" Background="{DynamicResource ToolbarBrush}" CornerRadius="12,12,0,0">
-                                <Grid x:Name="CleanupHeaderGrid" Margin="20,0,18,0">
+                            <Border Grid.Row="0" Background="{DynamicResource ToolbarBrush}">
+                                <Grid x:Name="CleanupHeaderGrid" Margin="20,0">
                                     <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
                                     <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
                                         <TextBlock Text="Cleanup" Foreground="{DynamicResource TextBrush}" FontSize="15" FontWeight="SemiBold" VerticalAlignment="Center"/>
@@ -2330,11 +2395,11 @@ namespace MTWinTools {
                                     </StackPanel>
                                 </Grid>
                             </Border>
-                            <ScrollViewer x:Name="CleanupScroll" Grid.Row="1" Style="{StaticResource OverlayScrollViewerStyle}" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" CanContentScroll="False" Padding="22,22,10,10">
+                            <ScrollViewer x:Name="CleanupScroll" Grid.Row="1" Style="{StaticResource OverlayScrollViewerStyle}" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" CanContentScroll="False" Padding="24,24,12,12">
                                 <StackPanel x:Name="CleanupGrid"/>
                             </ScrollViewer>
-                            <Border Grid.Row="2" Background="{DynamicResource ToolbarBrush}" CornerRadius="0,0,12,12">
-                                <Grid x:Name="CleanupActionFrame" Margin="16,12,16,12">
+                            <Border Grid.Row="2" Background="{DynamicResource ToolbarBrush}">
+                                <Grid x:Name="CleanupActionFrame" Margin="20,12,20,12">
                                     <Grid x:Name="CleanupActionPanel">
                                         <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
                                         <TextBlock x:Name="CleanupStatusText" Grid.Column="0" Text="" Foreground="{DynamicResource SubtleBrush}" FontSize="13" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" Margin="0,0,14,0"/>
@@ -2351,11 +2416,11 @@ namespace MTWinTools {
                         </Grid>
                     </Border>
 
-                    <Border x:Name="TweaksPanel" Background="{DynamicResource PanelBrush}" CornerRadius="12" Visibility="Collapsed">
+                    <Border x:Name="TweaksPanel" Background="{DynamicResource PanelBrush}" Visibility="Collapsed">
                         <Grid>
                             <Grid.RowDefinitions><RowDefinition Height="52"/><RowDefinition Height="*"/><RowDefinition Height="68"/></Grid.RowDefinitions>
-                            <Border Grid.Row="0" Background="{DynamicResource ToolbarBrush}" CornerRadius="12,12,0,0">
-                                <Grid x:Name="TweaksHeaderGrid" Margin="20,0,18,0">
+                            <Border Grid.Row="0" Background="{DynamicResource ToolbarBrush}">
+                                <Grid x:Name="TweaksHeaderGrid" Margin="20,0">
                                     <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
                                     <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
                                         <TextBlock x:Name="TweaksPanelTitle" Text="Privacy" Foreground="{DynamicResource TextBrush}" FontSize="15" FontWeight="SemiBold" VerticalAlignment="Center"/>
@@ -2367,7 +2432,7 @@ namespace MTWinTools {
                                     </StackPanel>
                                 </Grid>
                             </Border>
-                            <ScrollViewer x:Name="TweaksScroll" Grid.Row="1" Style="{StaticResource OverlayScrollViewerStyle}" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" CanContentScroll="False" Padding="22,22,10,10">
+                            <ScrollViewer x:Name="TweaksScroll" Grid.Row="1" Style="{StaticResource OverlayScrollViewerStyle}" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" CanContentScroll="False" Padding="24,24,12,12">
                                 <StackPanel>
                                     <StackPanel x:Name="TweakPrivacyGrid"/>
                                     <StackPanel x:Name="TweakDebloatGrid" Visibility="Collapsed"/>
@@ -2380,8 +2445,8 @@ namespace MTWinTools {
                                     <StackPanel x:Name="TweakDevicesGrid" Visibility="Collapsed"/>
                                 </StackPanel>
                             </ScrollViewer>
-                            <Border Grid.Row="2" Background="{DynamicResource ToolbarBrush}" CornerRadius="0,0,12,12">
-                                <Grid x:Name="TweaksActionFrame" Margin="16,12,16,12">
+                            <Border Grid.Row="2" Background="{DynamicResource ToolbarBrush}">
+                                <Grid x:Name="TweaksActionFrame" Margin="20,12,20,12">
                                     <Grid x:Name="TweaksActionPanel">
                                         <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
                                         <TextBlock x:Name="TweaksStatusText" Grid.Column="0" Text="" Foreground="{DynamicResource SubtleBrush}" FontSize="13" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" Margin="0,0,14,0"/>
@@ -2398,13 +2463,13 @@ namespace MTWinTools {
                         </Grid>
                     </Border>
 
-                    <Border x:Name="SystemAppsPanel" Background="{DynamicResource PanelBrush}" CornerRadius="12" Visibility="Collapsed">
+                    <Border x:Name="SystemAppsPanel" Background="{DynamicResource PanelBrush}" Visibility="Collapsed">
                         <Grid>
                             <Grid.RowDefinitions><RowDefinition Height="52"/><RowDefinition Height="*"/></Grid.RowDefinitions>
-                            <Border Grid.Row="0" Background="{DynamicResource ToolbarBrush}" CornerRadius="12,12,0,0">
+                            <Border Grid.Row="0" Background="{DynamicResource ToolbarBrush}">
                                 <TextBlock x:Name="SystemAppsHeaderText" Text="System Apps" Foreground="{DynamicResource TextBrush}" FontSize="15" FontWeight="SemiBold" Margin="20,0" VerticalAlignment="Center"/>
                             </Border>
-                            <ScrollViewer x:Name="SystemAppsScroll" Grid.Row="1" Style="{StaticResource OverlayScrollViewerStyle}" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" CanContentScroll="False" Padding="22,22,10,10">
+                            <ScrollViewer x:Name="SystemAppsScroll" Grid.Row="1" Style="{StaticResource OverlayScrollViewerStyle}" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" CanContentScroll="False" Padding="24,24,12,12">
                                 <StackPanel x:Name="SystemAppsGrid"/>
                             </ScrollViewer>
                         </Grid>
@@ -2417,7 +2482,7 @@ namespace MTWinTools {
                    Foreground="{DynamicResource SubtleBrush}" FontSize="13" TextWrapping="Wrap" TextAlignment="Center" Margin="12,14,12,0"/>
         </Grid>
 
-        <TextBlock x:Name="SiteCredit" Grid.Row="1" HorizontalAlignment="Center" Foreground="{DynamicResource SubtleBrush}" FontSize="13" Margin="0,12,0,14">
+        <TextBlock x:Name="SiteCredit" Grid.Row="1" HorizontalAlignment="Center" Foreground="{DynamicResource SubtleBrush}" FontSize="13" Margin="0,28,0,14">
             <Run Text="&#169; 2026 micknorj &#183; Mick's Tools &#183; "/><Hyperlink x:Name="GitHubLink" NavigateUri="https://github.com/micknorj" Foreground="{DynamicResource MutedBrush}" FontWeight="SemiBold" TextDecorations="{x:Null}">GitHub</Hyperlink>
         </TextBlock>
     </Grid>
@@ -2486,22 +2551,23 @@ function Set-MTWinAppearance {
         [bool]$Animate = $true
     )
 
+    $Animate = $Animate -and [Windows.SystemParameters]::ClientAreaAnimation
     $script:AppearanceMode = $Mode
     $light = if ($Mode -eq 'System') { Get-MTWinSystemUsesLightTheme } else { $Mode -eq 'Light' }
     $script:CurrentLightTheme = $light
 
     if ($light) {
         $colors = @{
-            PageBrush='#eef0ee'; SurfaceBrush='#f8f9f7'; PanelBrush='#ecefeb'; RaisedBrush='#e1e5e1';
-            ControlBrush='#d9ded9'; SelectedBrush='#cbd2cc'; TextBrush='#222725'; MutedBrush='#525c57';
-            SubtleBrush='#6f7974'; FocusBrush='#332a503d'; ToolbarBrush='#e6eae6'; WarningBrush='#7d642f'
+            PageBrush='#f0f0f0'; SurfaceBrush='#fafafa'; PanelBrush='#ececec'; RaisedBrush='#e2e2e2';
+            ControlBrush='#d8d8d8'; SelectedBrush='#c8c8c8'; TextBrush='#242424'; MutedBrush='#565656';
+            SubtleBrush='#666666'; FocusBrush='#7a000000'; ToolbarBrush='#e7e7e7'; WarningBrush='#4b4b4b'
         }
     }
     else {
         $colors = @{
-            PageBrush='#0b0d0f'; SurfaceBrush='#14171a'; PanelBrush='#1a1e22'; RaisedBrush='#22272d';
-            ControlBrush='#272d34'; SelectedBrush='#343c45'; TextBrush='#f4f6f8'; MutedBrush='#b7bec6';
-            SubtleBrush='#8f98a2'; FocusBrush='#47b5cde6'; ToolbarBrush='#1e2328'; WarningBrush='#e2c17d'
+            PageBrush='#101010'; SurfaceBrush='#181818'; PanelBrush='#1e1e1e'; RaisedBrush='#282828';
+            ControlBrush='#303030'; SelectedBrush='#404040'; TextBrush='#f5f5f5'; MutedBrush='#c0c0c0';
+            SubtleBrush='#a0a0a0'; FocusBrush='#7affffff'; ToolbarBrush='#242424'; WarningBrush='#dedede'
         }
     }
 
@@ -2525,6 +2591,7 @@ function Set-MTWinAppearance {
             $animation.Duration = [Windows.Duration]::new([TimeSpan]::FromMilliseconds(140))
             $animation.FillBehavior = [Windows.Media.Animation.FillBehavior]::Stop
             $animation.EasingFunction = [Windows.Media.Animation.CubicEase]::new()
+            $animation.EasingFunction.EasingMode = [Windows.Media.Animation.EasingMode]::EaseInOut
             $brush.BeginAnimation([Windows.Media.SolidColorBrush]::ColorProperty, $animation)
         }
         $window.Resources[$key] = $brush
@@ -2548,6 +2615,7 @@ function Set-MTWinAppearance {
         $shadowAnimation.Duration = [Windows.Duration]::new([TimeSpan]::FromMilliseconds(140))
         $shadowAnimation.FillBehavior = [Windows.Media.Animation.FillBehavior]::Stop
         $shadowAnimation.EasingFunction = [Windows.Media.Animation.CubicEase]::new()
+        $shadowAnimation.EasingFunction.EasingMode = [Windows.Media.Animation.EasingMode]::EaseInOut
         $shadow.BeginAnimation([Windows.Media.Effects.DropShadowEffect]::OpacityProperty, $shadowAnimation)
     }
     $MainShell.Effect = $shadow
@@ -2571,7 +2639,7 @@ function New-MTWinSectionHeading {
     $heading.Text = $Text
     $heading.FontSize = 17
     $heading.FontWeight = [Windows.FontWeights]::SemiBold
-    $heading.Margin = if ($Grid.Children.Count -eq 0) { '0,0,0,14' } else { '0,14,0,14' }
+    $heading.Margin = if ($Grid.Children.Count -eq 0) { '0,0,0,16' } else { '0,12,0,16' }
     $heading.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'TextBrush')
     $Grid.Children.Add($heading) | Out-Null
 }
@@ -2584,7 +2652,7 @@ function New-MTWinCardContent {
 
     $title = New-Object Windows.Controls.TextBlock
     $title.Text = $Name
-    $title.FontSize = 15
+    $title.FontSize = 16
     $title.FontWeight = [Windows.FontWeights]::Medium
     $title.LineHeight = 20
     $title.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'TextBrush')
@@ -2597,12 +2665,14 @@ function New-MTWinCardContent {
     $grid.ColumnDefinitions.Add((New-Object Windows.Controls.ColumnDefinition -Property @{ Width='Auto' }))
     $grid.ColumnDefinitions.Add((New-Object Windows.Controls.ColumnDefinition -Property @{ Width='*' }))
 
-    $dot = New-Object Windows.Shapes.Ellipse
-    $dot.Width = 7
-    $dot.Height = 7
+    $dot = New-Object Windows.Controls.TextBlock
+    $dot.Text = '!'
+    $dot.FontSize = 16
+    $dot.FontWeight = [Windows.FontWeights]::Bold
+    [Windows.Automation.AutomationProperties]::SetName($dot, 'Risky change')
     $dot.Margin = '0,0,9,0'
     $dot.VerticalAlignment = 'Center'
-    $dot.SetResourceReference([Windows.Shapes.Shape]::FillProperty, 'WarningBrush')
+    $dot.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'WarningBrush')
     $grid.Children.Add($dot) | Out-Null
 
     [Windows.Controls.Grid]::SetColumn($title, 1)
@@ -2619,7 +2689,7 @@ function New-MTWinSystemAppContent {
 
     $title = New-Object Windows.Controls.TextBlock
     $title.Text = $Name
-    $title.FontSize = 15
+    $title.FontSize = 16
     $title.FontWeight = [Windows.FontWeights]::Medium
     $title.TextWrapping = 'Wrap'
     $title.VerticalAlignment = 'Center'
@@ -2662,7 +2732,7 @@ function Add-MTWinSelectionCards {
         $checkBox.Style = $window.FindResource('CardCheckBoxStyle')
         $checkBox.Tag = $definition.Id
         $checkBox.Content = New-MTWinCardContent -Name $definition.Name -Risk ([bool]$definition.Risk)
-        $checkBox.Margin = '0,0,10,10'
+        $checkBox.Margin = '0,0,12,12'
         $wrap.Children.Add($checkBox) | Out-Null
         $ControlMap[$definition.Id] = $checkBox
         $script:ResponsiveCards.Add([pscustomobject]@{ Control=$checkBox; Scroll=$Scroll }) | Out-Null
@@ -2690,7 +2760,7 @@ function Add-MTWinPreferenceCards {
         $toggle.Style = $window.FindResource('PreferenceToggleStyle')
         $toggle.Tag = $definition.Id
         $toggle.Content = New-MTWinCardContent -Name $definition.Name
-        $toggle.Margin = '0,0,10,10'
+        $toggle.Margin = '0,0,12,12'
         $toggle.IsChecked = [bool](Get-MTWinPreferenceState $definition.Id)
         $script:PreferenceInitial[$definition.Id] = [bool]$toggle.IsChecked
         $script:PreferenceControls[$definition.Id] = $toggle
@@ -2714,9 +2784,9 @@ function Add-MTWinChoiceRows {
     foreach ($definition in $Definitions) {
         $border = New-Object Windows.Controls.Border
         $border.MinHeight = 68
-        $border.CornerRadius = 10
+        $border.CornerRadius = 12
         $border.Padding = 14
-        $border.Margin = '0,0,10,10'
+        $border.Margin = '0,0,12,12'
         $border.SetResourceReference([Windows.Controls.Border]::BackgroundProperty, 'ControlBrush')
 
         $row = New-Object Windows.Controls.Grid
@@ -2762,7 +2832,7 @@ function Add-MTWinSystemAppCards {
         $button.Style = $window.FindResource('SystemAppButtonStyle')
         $button.Tag = $definition
         $button.Content = New-MTWinSystemAppContent -Name $definition.Name
-        $button.Margin = '0,0,10,10'
+        $button.Margin = '0,0,12,12'
         $button.Add_Click({
             $sender = $args[0]
             Start-MTWinSystemApp -Definition $sender.Tag
@@ -2779,13 +2849,13 @@ function Resize-MTWinCards {
         $maxColumns = if ($null -ne $item.PSObject.Properties['MaxColumns']) { [int]$item.MaxColumns } else { 3 }
 
         if ($maxColumns -le 2) {
-            if ($available -ge 520) { $width = [Math]::Floor(($available - 20) / 2) }
-            else { $width = [Math]::Max(220, $available - 10) }
+            if ($available -ge 520) { $width = [Math]::Floor(($available - 24) / 2) }
+            else { $width = [Math]::Max(220, $available - 12) }
         }
         else {
-            if ($available -ge 780) { $width = [Math]::Floor(($available - 30) / 3) }
-            elseif ($available -ge 520) { $width = [Math]::Floor(($available - 20) / 2) }
-            else { $width = [Math]::Max(220, $available - 10) }
+            if ($available -ge 780) { $width = [Math]::Floor(($available - 36) / 3) }
+            elseif ($available -ge 520) { $width = [Math]::Floor(($available - 24) / 2) }
+            else { $width = [Math]::Max(220, $available - 12) }
         }
         $item.Control.Width = $width
     }
@@ -2799,13 +2869,13 @@ function Set-MTWinCompactNavigation {
         $ShellGrid.ColumnDefinitions[1].Width = [Windows.GridLength]::new(0)
         $ShellGrid.ColumnDefinitions[2].Width = [Windows.GridLength]::new(0)
         $ShellGrid.RowDefinitions[0].Height = [Windows.GridLength]::Auto
-        $ShellGrid.RowDefinitions[1].Height = [Windows.GridLength]::new(8)
+        $ShellGrid.RowDefinitions[1].Height = [Windows.GridLength]::new(2)
         $ShellGrid.RowDefinitions[2].Height = [Windows.GridLength]::new(1, [Windows.GridUnitType]::Star)
         [Windows.Controls.Grid]::SetColumn($RailPanel, 0)
         [Windows.Controls.Grid]::SetRow($RailPanel, 0)
         [Windows.Controls.Grid]::SetColumn($WorkspaceHost, 0)
         [Windows.Controls.Grid]::SetRow($WorkspaceHost, 2)
-        $RailPanel.Padding = '8'
+        $RailPanel.Padding = '16'
         $RailScroll.VerticalScrollBarVisibility = 'Disabled'
         $RailScroll.HorizontalScrollBarVisibility = 'Hidden'
         $RailScroll.PanningMode = 'HorizontalOnly'
@@ -2823,7 +2893,7 @@ function Set-MTWinCompactNavigation {
     }
     else {
         $ShellGrid.ColumnDefinitions[0].Width = [Windows.GridLength]::new(214)
-        $ShellGrid.ColumnDefinitions[1].Width = [Windows.GridLength]::new(12)
+        $ShellGrid.ColumnDefinitions[1].Width = [Windows.GridLength]::new(2)
         $ShellGrid.ColumnDefinitions[2].Width = [Windows.GridLength]::new(1, [Windows.GridUnitType]::Star)
         $ShellGrid.RowDefinitions[0].Height = [Windows.GridLength]::new(1, [Windows.GridUnitType]::Star)
         $ShellGrid.RowDefinitions[1].Height = [Windows.GridLength]::new(0)
@@ -2832,7 +2902,7 @@ function Set-MTWinCompactNavigation {
         [Windows.Controls.Grid]::SetRow($RailPanel, 0)
         [Windows.Controls.Grid]::SetColumn($WorkspaceHost, 2)
         [Windows.Controls.Grid]::SetRow($WorkspaceHost, 0)
-        $RailPanel.Padding = '10'
+        $RailPanel.Padding = '16'
         $RailScroll.VerticalScrollBarVisibility = 'Auto'
         $RailScroll.HorizontalScrollBarVisibility = 'Disabled'
         $RailScroll.PanningMode = 'VerticalOnly'
@@ -2904,25 +2974,26 @@ function Update-MTWinResponsiveLayout {
     # This prevents either text row from being clipped when the window is restored.
     $rootAppRowHeight = $RootGrid.RowDefinitions[0].ActualHeight
     if ($rootAppRowHeight -le 0) { $rootAppRowHeight = $clientHeight }
-    $availableAppHeight = [Math]::Max(0.0, $rootAppRowHeight - 34.0) # AppGrid top + bottom margins.
+    $appVerticalMargin = if ($compact) { 34.0 } else { 44.0 }
+    $availableAppHeight = [Math]::Max(0.0, $rootAppRowHeight - $appVerticalMargin)
     $AppGrid.Height = [Math]::Min(826.0, $availableAppHeight)
     $MainShell.MinHeight = 320.0
     $MainShell.Height = [double]::NaN
 
-        $AppGrid.Margin = if ($compact) { '16,20,16,14' } else { '24,20,24,14' }
+        $AppGrid.Margin = if ($compact) { '16,20,16,14' } else { '24,28,24,16' }
         $HeaderGrid.Margin = '4,0,4,20'
-        $MainShell.Padding = '12'
-        $CleanupHeaderGrid.Margin = '20,0,18,0'
-        $TweaksHeaderGrid.Margin = '20,0,18,0'
+        $MainShell.Padding = '0'
+        $CleanupHeaderGrid.Margin = '20,0'
+        $TweaksHeaderGrid.Margin = '20,0'
         $SystemAppsHeaderText.Margin = '20,0'
-        $CleanupScroll.Padding = '22,22,10,10'
-        $TweaksScroll.Padding = '22,22,10,10'
-        $SystemAppsScroll.Padding = '22,22,10,10'
-        $CleanupActionFrame.Margin = '16,12,16,12'
-        $TweaksActionFrame.Margin = '16,12,16,12'
+        $CleanupScroll.Padding = '24,24,12,12'
+        $TweaksScroll.Padding = '24,24,12,12'
+        $SystemAppsScroll.Padding = '24,24,12,12'
+        $CleanupActionFrame.Margin = '20,12,20,12'
+        $TweaksActionFrame.Margin = '20,12,20,12'
         $LocalNote.Margin = '12,14,12,0'
         $SiteCredit.Margin = '0,28,0,14'
-        $TitleText.FontSize = 32
+        $TitleText.FontSize = 36
         $AppearanceButton.Height = 40
         $AppearanceButton.Padding = '14,0'
         $AppearanceButton.FontSize = 14
@@ -3008,7 +3079,7 @@ function Update-MTWinSelectionState {
 
 function Set-MTWinBusy {
     param([bool]$Busy)
-    $MainShell.IsHitTestVisible = -not $Busy
+    $MainShell.IsEnabled = -not $Busy
 }
 
 function Clear-MTWinInlineConfirmation {
@@ -3048,6 +3119,7 @@ function Start-MTWinUiOperation {
         [Parameter(Mandatory = $true)][string[]]$Ids
     )
 
+    if ($null -ne $script:ActiveJob) { return }
     Clear-MTWinInlineConfirmation
     Set-MTWinBusy $true
     $selectionText = if ($Kind -eq 'Cleanup') { $CleanupSelectionText } else { $TweaksSelectionText }
@@ -3070,14 +3142,17 @@ function Start-MTWinUiOperation {
 function Show-MTWinElementFade {
     param([Parameter(Mandatory = $true)][Windows.UIElement]$Element)
 
+    $Element.BeginAnimation([Windows.UIElement]::OpacityProperty, $null)
     $Element.Opacity = 1
     $Element.Visibility = 'Visible'
+    if (-not [Windows.SystemParameters]::ClientAreaAnimation) { return }
     $animation = [Windows.Media.Animation.DoubleAnimation]::new()
     $animation.From = 0
     $animation.To = 1
     $animation.Duration = [Windows.Duration]::new([TimeSpan]::FromMilliseconds(140))
     $animation.FillBehavior = [Windows.Media.Animation.FillBehavior]::Stop
     $animation.EasingFunction = [Windows.Media.Animation.CubicEase]::new()
+    $animation.EasingFunction.EasingMode = [Windows.Media.Animation.EasingMode]::EaseInOut
     $Element.BeginAnimation([Windows.UIElement]::OpacityProperty, $animation)
 }
 
@@ -3103,8 +3178,7 @@ function Show-MTWinTweakView {
         $view = $script:TweakViewControls[$key]
         if ($key -eq $Name) {
             $view.BeginAnimation([Windows.UIElement]::OpacityProperty, $null)
-            $view.Opacity = 1
-            $view.Visibility = 'Visible'
+            Show-MTWinElementFade -Element $view
         }
         else { $view.Visibility = 'Collapsed' }
     }
@@ -3140,6 +3214,7 @@ function Show-MTWinPanel {
         $CleanupPanel.BeginAnimation([Windows.UIElement]::OpacityProperty, $null)
         $CleanupPanel.Opacity = 1
         $CleanupPanel.Visibility = 'Visible'
+        Show-MTWinElementFade -Element $CleanupGrid
         $CleanupScroll.ScrollToTop()
     }
     elseif ($Name -eq 'Tweaks') {
@@ -3154,6 +3229,7 @@ function Show-MTWinPanel {
         $SystemAppsPanel.BeginAnimation([Windows.UIElement]::OpacityProperty, $null)
         $SystemAppsPanel.Opacity = 1
         $SystemAppsPanel.Visibility = 'Visible'
+        Show-MTWinElementFade -Element $SystemAppsGrid
         $SystemAppsScroll.ScrollToTop()
     }
 
@@ -3397,6 +3473,19 @@ if ($null -ne $GitHubLink) {
     })
 }
 
+function Receive-MTWinOperationJobResult {
+    param([Parameter(Mandatory = $true)]$Job)
+
+    $output = @($Job.PowerShell.EndInvoke($Job.Async))
+    if ($Job.PowerShell.HadErrors) {
+        throw ('Operation worker failed: ' + ($Job.PowerShell.Streams.Error -join '; '))
+    }
+    if ($output.Count -eq 0 -or $null -eq $output[-1].PSObject.Properties['CompletedIds']) {
+        throw 'The operation worker did not return a completion summary.'
+    }
+    return $output[-1]
+}
+
 $script:JobTimer = New-Object Windows.Threading.DispatcherTimer
 $script:JobTimer.Interval = [TimeSpan]::FromMilliseconds(160)
 $script:JobTimer.Add_Tick({
@@ -3411,8 +3500,7 @@ $script:JobTimer.Add_Tick({
     $result = $null
     $jobFailed = $false
     try {
-        $output = @($job.PowerShell.EndInvoke($job.Async))
-        if ($output.Count -gt 0) { $result = $output[-1] }
+        $result = Receive-MTWinOperationJobResult -Job $job
     }
     catch {
         $jobFailed = $true
@@ -3432,22 +3520,30 @@ $script:JobTimer.Add_Tick({
     }
     elseif ($failureCount -gt 0) {
         Write-MTWinStatus -Message ("$($result.Kind) finished with $failureCount failed operation(s).") -Level Error
-        $activeStatusText.Text = "Finished | $failureCount failed"
+        $activeStatusText.Text = "Finished | $(@($result.CompletedIds).Count) completed | $failureCount failed | $(@($result.SkippedIds).Count) skipped"
     }
     else {
         $completedKind = if ($result) { $result.Kind } else { $job.Kind }
         Write-MTWinStatus -Message ($completedKind + ' finished.') -Level Success
-        $activeStatusText.Text = "Finished | $($job.Total) completed"
+        $activeStatusText.Text = "Finished | $(@($result.CompletedIds).Count) completed | $(@($result.SkippedIds).Count) skipped"
     }
 
-    if ($job.Kind -eq 'Tweaks') {
+    if ($job.Kind -eq 'Tweaks' -and -not $jobFailed) {
         foreach ($definition in $preferenceDefinitions) {
             $state = [bool](Get-MTWinPreferenceState $definition.Id)
             $script:PreferenceInitial[$definition.Id] = $state
-            $script:PreferenceControls[$definition.Id].IsChecked = $state
+            # Keep failed requests queued so the user can retry them.
+            if (-not $script:PreferenceDirty.ContainsKey($definition.Id) -or
+                $result.CompletedIds -contains ('Preference|' + $definition.Id + '|1') -or
+                $result.CompletedIds -contains ('Preference|' + $definition.Id + '|0')) {
+                $script:PreferenceControls[$definition.Id].IsChecked = $state
+                $script:PreferenceDirty.Remove($definition.Id)
+            }
         }
-        $script:PreferenceDirty.Clear()
-        foreach ($control in $script:ChoiceControls.Values) { $control.SelectedIndex = 0 }
+        foreach ($id in $result.CompletedIds) {
+            if ($id -match '^Choice\|([^|]+)\|') { $script:ChoiceControls[$matches[1]].SelectedIndex = 0 }
+            elseif ($script:TweakControls.ContainsKey($id)) { $script:TweakControls[$id].IsChecked = $false }
+        }
     }
     Update-MTWinSelectionState
 })
@@ -3458,6 +3554,14 @@ $systemThemeHandler = [Microsoft.Win32.UserPreferenceChangedEventHandler]{
         $window.Dispatcher.BeginInvoke([action]{ Set-MTWinAppearance System }) | Out-Null
     }
 }
+
+$MainShell.Add_SizeChanged({
+    $clip = [Windows.Media.RectangleGeometry]::new()
+    $clip.Rect = [Windows.Rect]::new(0, 0, $MainShell.ActualWidth, $MainShell.ActualHeight)
+    $clip.RadiusX = 24
+    $clip.RadiusY = 24
+    $MainShell.Clip = $clip
+})
 
 $window.Add_SourceInitialized({ Set-MTWinAppearance -Mode System -Animate $false })
 $window.Add_Loaded({

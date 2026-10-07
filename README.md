@@ -34,7 +34,7 @@ The script requests administrator approval automatically when required. No insta
 Run the tagged release directly from GitHub:
 
 ```powershell
-irm https://raw.githubusercontent.com/micknorj/MT-win-tools/v0.1/MT-win-tools.ps1 | iex
+irm https://raw.githubusercontent.com/micknorj/MT-win-tools/v0.1.1/MT-win-tools.ps1 | iex
 ```
 
 This retrieves and executes the tagged script immediately. Use a release tag rather than `main` when a fixed version is required.
@@ -63,9 +63,9 @@ Unblock-File .\MT-win-tools.ps1
 If using the release ZIP, unblock the archive before extracting it so the extracted files do not inherit the mark:
 
 ```powershell
-Unblock-File .\MT-win-tools-v0.1.zip
-Expand-Archive .\MT-win-tools-v0.1.zip
-Set-Location .\MT-win-tools-v0.1\MT-win-tools
+Unblock-File .\MT-win-tools-v0.1.1.zip
+Expand-Archive .\MT-win-tools-v0.1.1.zip
+Set-Location .\MT-win-tools-v0.1.1\MT-win-tools
 .\MT-win-tools.ps1
 ```
 
@@ -101,6 +101,15 @@ Higher-impact operations require explicit in-application confirmation. See the [
 
 The project has no build step or external dependencies.
 
+Run the regression checks without applying changes to Windows:
+
+```powershell
+powershell -NoProfile -STA -ExecutionPolicy Bypass -File .\tests\Regression.Tests.ps1
+pwsh -NoProfile -STA -File .\tests\Regression.Tests.ps1
+```
+
+The checks use mocked system operations and isolated temporary files. Live cleanup and configuration behavior should be checked on a disposable Windows test machine.
+
 To run a PowerShell syntax check from the repository root:
 
 ```powershell
@@ -115,6 +124,27 @@ $errors
 ```
 
 No output indicates that the PowerShell parser found no syntax errors. Interface behavior still requires testing on Windows because the application uses WPF and Windows APIs.
+
+## Preparing a release
+
+From the repository root, run:
+
+```powershell
+powershell -NoProfile -STA -ExecutionPolicy Bypass -File .\scripts\Package.ps1
+```
+
+This runs the regression checks, packages the tested source and documentation, verifies the ZIP contents, and writes `dist/v0.1.1/MT-win-tools-v0.1.1.zip`, the standalone script, release notes, and unsigned `SHA256SUMS.txt`. Existing version 0.1 artifacts are retained.
+
+After committing and pushing the tested source, create and verify a signed tag, push it, and publish the prepared files with GitHub CLI. Run each line only after the preceding command succeeds. Git signing must already be configured:
+
+```powershell
+git tag -s v0.1.1 -m "MT win tools v0.1.1"
+git verify-tag v0.1.1
+git push origin v0.1.1
+gh release create v0.1.1 --repo micknorj/MT-win-tools --verify-tag --title "MT win tools v0.1.1" --notes-file .\RELEASE_NOTES.md .\dist\v0.1.1\MT-win-tools-v0.1.1.zip .\dist\v0.1.1\MT-win-tools.ps1 .\dist\v0.1.1\SHA256SUMS.txt
+```
+
+The packaging command does not stage, commit, tag, push, or publish anything.
 
 ## Changelog
 
